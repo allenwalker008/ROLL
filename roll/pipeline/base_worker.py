@@ -13,6 +13,7 @@ from roll.configs.worker_config import WorkerConfig
 from roll.distributed.executor.worker import Worker
 from roll.distributed.scheduler.decorator import Dispatch, register
 from roll.distributed.scheduler.protocol import DataProto
+from roll.utils.transferqueue_utils import tqbridge
 from roll.distributed.strategy.factory import create_strategy
 from roll.distributed.strategy.strategy import InferenceStrategy, TrainStrategy
 from roll.models.model_providers import (
@@ -57,6 +58,7 @@ class ActorWorker(Worker):
         self.strategy.offload_states()
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
+    @tqbridge(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def train_step(self, data: DataProto):
         """
         return DataProto(meta_info={'metrics': metrics})
@@ -122,6 +124,7 @@ class ActorWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
+    @tqbridge(dispatch_mode=Dispatch.DP_MP_DISPATCH_FIRST)
     def compute_log_probs(self, data: DataProto):
         """
         return DataProto.from_dict(tensors={'log_probs': output})
@@ -563,6 +566,7 @@ class CriticWorker(Worker):
         self.strategy.offload_states()
 
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
+    @tqbridge(dispatch_mode=Dispatch.DP_MP_COMPUTE)
     def compute_values(self, data: DataProto):
         """
         return DataProto.from_dict(tensors={'values': values})
@@ -592,6 +596,7 @@ class CriticWorker(Worker):
         return output
 
     @register(dispatch_mode=Dispatch.DP_MP_COMPUTE)
+    @tqbridge(dispatch_mode=Dispatch.DP_MP_COMPUTE)
     def train_step(self, data: DataProto):
         """
         return DataProto(meta_info={'metrics': metrics})

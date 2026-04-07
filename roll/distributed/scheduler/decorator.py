@@ -23,6 +23,17 @@ logger = get_logger()
 BIND_WORKER_METHOD_FLAG = "BIND_WORKER_METHOD_FLAG"
 
 
+def _is_tq_enabled(cluster) -> bool:
+    """Return True if TransferQueue is enabled for this cluster's pipeline."""
+    pipeline_config = getattr(cluster, "pipeline_config", None)
+    if pipeline_config is None:
+        return False
+    tq_conf = getattr(pipeline_config, "transfer_queue", None)
+    if tq_conf is None:
+        return False
+    return getattr(tq_conf, "enable", False)
+
+
 class Dispatch(Enum):
     """
     dispatch 负责处理Cluster的输入list如何拆分分配到各worker上
@@ -109,7 +120,114 @@ def dispatch_all_to_all(cluster, *args, **kwargs):
 def _dispatch_dp_mp_compute(cluster, _dispatch_first, *args, **kwargs):
     """
     将输入chunk成dp_world_size份，按dp_rank为每个worker组织数据 -> 同一dp_rank收到的数据都是相同的
+
+    When TQ is enabled:
+      - Each DataProto arg is written to TQ in bulk; workers receive a BatchMeta
+        slice instead of the full tensor payload.
+      - tp/pp ranks that would receive None (dispatch_first mode) receive an empty
+        BatchMeta so type checking in @tqbridge stays consistent.
     """
+    use_tq = _is_tq_enabled(cluster)
+
+    if use_tq:
+        import transfer_queue as tq_mod
+        tq_client = tq_mod.get_client()
+
+        def _calc_size_mb(td) -> float:
+            """Approximate serialized size of a TensorDict in MB."""
+            total = 0
+            for v in td.values():
+                if hasattr(v, 'nbytes'):
+                    total += v.nbytes
+            return total / (1024 * 1024)
+
+        def _dataproto_to_batchmeta_shards(data: DataProto, dp_size: int):
+            """Write *data* to TQ and return a list of dp_size BatchMeta shards."""
+            import asyncio
+            import time
+
+            td = data.batch  # TensorDict
+            meta_info = data.meta_info
+            non_tensor_batch = data.non_tensor_batch
+
+            data_mb = _calc_size_mb(td)
+            n_rows = td.batch_size[0] if td.batch_size else 0
+            logger.info(
+                f"[TQ dispatch] TRIGGERED | rows={n_rows} | tensor_data={data_mb:.2f}MB "
+                f"(this would have gone through Ray) | dp_size={dp_size}"
+            )
+
+            def _run(coro):
+                loop = asyncio.new_event_loop()
+                try:
+                    return loop.run_until_complete(coro)
+                finally:
+                    loop.close()
+
+            t0 = time.time()
+            from roll.utils.transferqueue_utils import _pack_extra_info
+            full_meta = _run(tq_client.async_put(
+                data=td,
+                metadata=None,
+            ))
+            full_meta.extra_info = _pack_extra_info(meta_info, non_tensor_batch)
+            tq_cost = time.time() - t0
+            logger.info(
+                f"[TQ dispatch] PUT DONE | rows={n_rows} | data={data_mb:.2f}MB "
+                f"| TQ write cost={tq_cost:.3f}s | Ray would have serialized ~{data_mb:.2f}MB on copy"
+            )
+
+            # Split global_indexes across dp_size shards
+            all_idx = list(full_meta.global_indexes)
+            shard_size = (len(all_idx) + dp_size - 1) // dp_size
+            shards = []
+            for dp_rank in range(dp_size):
+                start = dp_rank * shard_size
+                end = min(start + shard_size, len(all_idx))
+                shard_idx = all_idx[start:end]
+                shard_meta = type(full_meta)(global_indexes=shard_idx, partition_ids=full_meta.partition_ids)
+                shard_meta.extra_info = full_meta.extra_info
+                shards.append(shard_meta)
+            return shards
+
+        # Replace DataProto positional args with BatchMeta shard lists
+        new_args = []
+        for arg in args:
+            if isinstance(arg, DataProto):
+                shards = _dataproto_to_batchmeta_shards(arg, cluster.dp_size)
+                new_args.append(shards)
+            else:
+                # Non-DataProto args: split as usual
+                new_args.append(arg.chunk(chunks=cluster.dp_size) if hasattr(arg, 'chunk') else [arg] * cluster.dp_size)
+        new_kwargs = {}
+        for k, v in kwargs.items():
+            if isinstance(v, DataProto):
+                new_kwargs[k] = _dataproto_to_batchmeta_shards(v, cluster.dp_size)
+            else:
+                new_kwargs[k] = v.chunk(chunks=cluster.dp_size) if hasattr(v, 'chunk') else [v] * cluster.dp_size
+
+        # Assign per-worker: tp/pp non-primary ranks get an empty BatchMeta
+        from transfer_queue import BatchMeta as _BatchMeta
+
+        def _get_tq_arg(arg_list, rank_info):
+            shard = arg_list[rank_info.dp_rank]
+            if _dispatch_first and not (rank_info.tp_rank == 0 and rank_info.cp_rank == 0 and rank_info.pp_rank == 0):
+                # Non-primary rank: send empty BatchMeta (tqbridge will skip TQ read)
+                empty = _BatchMeta(global_indexes=[], partition_ids=[])
+                return empty
+            return shard
+
+        all_args = tuple(
+            [_get_tq_arg(arg_list, cluster.get_rank_info(rank=i)) for i in range(cluster.world_size)]
+            for arg_list in new_args
+        )
+        all_kwargs = {
+            k: [_get_tq_arg(v_list, cluster.get_rank_info(rank=i)) for i in range(cluster.world_size)]
+            for k, v_list in new_kwargs.items()
+        }
+        return all_args, all_kwargs
+
+    # ---- original path (no TQ) ----
     splitted_args, splitted_kwargs = _split_args_kwargs(cluster.dp_size, *args, **kwargs)
     all_args = []
 
@@ -155,32 +273,98 @@ def collect_dp_mp_compute(cluster, output):
     """
     只需要搜集tp=0, pipeline_last_stage的结果
     输入输出都是list, 是batch维度的
+
+    When TQ is enabled:
+      - Representative ranks (tp=0, last pp stage, cp=0) have written their output
+        to TQ via @tqbridge and returned a BatchMeta.
+      - We merge those BatchMeta global_indexes and do a single get_data() call.
     """
-    output_in_dp = []
+    use_tq = _is_tq_enabled(cluster)
+
+    # Materialise Ray refs first when blocking=False
+    raw_output = output
+    is_refs = isinstance(output[0], ray.ObjectRef) if output else False
+    if is_refs:
+        import os, ray as _ray
+        timeout = int(os.environ.get("roll_RPC_TIMEOUT", 3600))
+        raw_output = _ray.get(list(output), timeout=timeout)
+
+    # Identify representative ranks
+    rep_results = []
+    rep_metas = []
     for global_rank in range(cluster.world_size):
         local_rank_info = cluster.get_rank_info(rank=global_rank)
         if local_rank_info.tp_rank == 0 and local_rank_info.is_pipeline_last_stage and local_rank_info.cp_rank == 0:
-            output_in_dp.append(output[global_rank])
-    if isinstance(output[0], list):
-        return list(chain.from_iterable(output_in_dp))
-    elif isinstance(output[0], DataProto):
-        return DataProto.concat(output_in_dp)
-    elif isinstance(output[0], ray.ObjectRef):
-        # 处理block=False情况下，dp内的可能完成时间不一致问题
+            val = raw_output[global_rank]
+            rep_results.append(val)
+
+    if use_tq:
+        from transfer_queue import BatchMeta as _BatchMeta
+        # Check if results are BatchMeta (TQ path)
+        if rep_results and isinstance(rep_results[0], _BatchMeta):
+            import time
+            from roll.utils.transferqueue_utils import _meta_to_dataproto, _split_extra_info
+
+            # Merge global_indexes from all dp representative ranks
+            merged_idx = []
+            merged_partition_ids = []
+            extra_info = None
+            for meta in rep_results:
+                merged_idx.extend(list(meta.global_indexes))
+                merged_partition_ids.extend(list(meta.partition_ids))
+                if extra_info is None:
+                    extra_info = getattr(meta, "extra_info", None)
+
+            merged_meta = _BatchMeta(
+                global_indexes=merged_idx,
+                partition_ids=merged_partition_ids,
+            )
+            if extra_info is not None:
+                merged_meta.extra_info = extra_info
+
+            logger.info(
+                f"[TQ collect] TRIGGERED | merging {len(rep_results)} dp ranks "
+                f"| total rows={len(merged_idx)}"
+            )
+            t0 = time.time()
+            result = _meta_to_dataproto(merged_meta)
+            tq_cost = time.time() - t0
+
+            # Compute result size for comparison
+            result_mb = 0.0
+            if result.batch is not None:
+                for v in result.batch.values():
+                    if hasattr(v, 'nbytes'):
+                        result_mb += v.nbytes
+                result_mb /= (1024 * 1024)
+            logger.info(
+                f"[TQ collect] GET DONE | rows={len(merged_idx)} | data={result_mb:.2f}MB "
+                f"| TQ read cost={tq_cost:.3f}s "
+                f"(without TQ, Ray would have returned ~{result_mb:.2f}MB from {len(rep_results)} workers)"
+            )
+
+            return result
+
+    # ---- original path (no TQ / non-BatchMeta results) ----
+    if is_refs:
+        # Re-wrap as ObjectRefWrap for blocking=False callers
         output_in_dp = []
         for global_rank in range(cluster.world_size):
             local_rank_info = cluster.get_rank_info(rank=global_rank)
-            collected = False
-            if (
+            collected = (
                 local_rank_info.tp_rank == 0
                 and local_rank_info.is_pipeline_last_stage
                 and local_rank_info.cp_rank == 0
-            ):
-                collected = True
+            )
             output_in_dp.append(ObjectRefWrap(output[global_rank], collected=collected))
         return output_in_dp
+
+    if isinstance(rep_results[0], list):
+        return list(chain.from_iterable(rep_results))
+    elif isinstance(rep_results[0], DataProto):
+        return DataProto.concat(rep_results)
     else:
-        raise NotImplementedError(f"output type {type(output[0])}")
+        raise NotImplementedError(f"output type {type(rep_results[0])}")
 
 
 predefined_dispatch_mode_fn = {

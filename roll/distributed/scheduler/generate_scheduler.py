@@ -674,8 +674,26 @@ class DynamicSamplingScheduler(RolloutMockMixin):
         collect_data_by_domain = defaultdict(list)
         data_off_policy_step = 0.0
         prompt_ids = set()
+
+        # ------ TQ: resolve BatchMeta → DataProto if TQ is enabled ------
+        tq_conf = getattr(self.pipeline_config, "transfer_queue", None)
+        use_tq = tq_conf is not None and getattr(tq_conf, "enable", False)
+        if use_tq:
+            try:
+                from transfer_queue import BatchMeta as _BatchMeta
+                from roll.utils.transferqueue_utils import _meta_to_dataproto
+                _has_batchmeta = True
+            except ImportError:
+                _has_batchmeta = False
+        else:
+            _has_batchmeta = False
+        # -----------------------------------------------------------------
+
         for item in finished_items:
-            collect_data_by_domain[item.domain].append(item.data)
+            data = item.data
+            if _has_batchmeta and isinstance(data, _BatchMeta):
+                data = _meta_to_dataproto(data)
+            collect_data_by_domain[item.domain].append(data)
             data_off_policy_step += self.replay_buffer.current_step - item.sampling_start_step
             prompt_ids.add(item.prompt_id)
         data_off_policy_step = data_off_policy_step / len(finished_items)
@@ -783,6 +801,52 @@ class RolloutContext:
                 scheduler.replay_buffer.abort(prompt_id)
             else:
                 assert context.sampling_start_step is not None
+
+                # ------ TQ: store BatchMeta instead of DataProto in ReplayBuffer ------
+                tq_conf = getattr(scheduler.pipeline_config, "transfer_queue", None)
+                use_tq = tq_conf is not None and getattr(tq_conf, "enable", False)
+                if use_tq:
+                    from roll.utils.transferqueue_utils import (
+                        _run_async_in_temp_loop, _pack_extra_info,
+                    )
+                    import transfer_queue as tq_mod
+                    tq_client = tq_mod.get_client()
+                    import time
+
+                    def _store_response_in_tq(response: DataProto):
+                        async def _put(resp):
+                            if resp.batch is None or len(resp.batch.batch_size) == 0 or resp.batch.batch_size[0] == 0:
+                                return None
+                            data_mb = sum(
+                                v.nbytes for v in resp.batch.values() if hasattr(v, 'nbytes')
+                            ) / (1024 * 1024)
+                            n_rows = resp.batch.batch_size[0]
+                            logger.info(
+                                f"[TQ replay] WRITE TRIGGERED | prompt_id={prompt_id} "
+                                f"| rows={n_rows} | data={data_mb:.2f}MB "
+                                f"(saved from in-process ReplayBuffer memory)"
+                            )
+                            t0 = time.time()
+                            meta = await tq_client.async_put(data=resp.batch, metadata=None)
+                            meta.extra_info = _pack_extra_info(resp.meta_info, resp.non_tensor_batch)
+                            write_cost = time.time() - t0
+                            logger.info(
+                                f"[TQ replay] WRITE DONE | prompt_id={prompt_id} "
+                                f"| rows={n_rows} | data={data_mb:.2f}MB "
+                                f"| TQ write cost={write_cost:.3f}s"
+                            )
+                            return meta
+                        return _run_async_in_temp_loop(_put, response)
+
+                    committed_responses = []
+                    for response in responses:
+                        batch_meta = _store_response_in_tq(response)
+                        committed_responses.append(
+                            batch_meta if batch_meta is not None else response
+                        )
+                    responses = committed_responses
+                # -----------------------------------------------------------------------
+
                 scheduler.replay_buffer.commit(
                     prompt_id,
                     [
